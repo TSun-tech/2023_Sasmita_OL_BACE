@@ -1,0 +1,834 @@
+---
+title: "Bace_manuscript_visulization"
+author: "TSun"
+format: html
+toc: true
+toc-depth: 4
+excute:
+  echo: false
+  warning: false
+editor: visual
+---
+
+### Please note that all data involved in this script has been pre-processed
+
+1.  all cell type annotations from original publication were checked
+2.  major cell populations were subset (excitatory neuron, inhibitory neuron, oligodendroglia, astrocyte, microglia, endothelial cells, and pericytes)
+3.  cell type are reannotated under "CellType_standard" column in meta.data
+4.  subset for only healthy samples
+
+### Create function for result exportation and visualization
+
+1.  added expression profile for App, Bace1, Psen1, Psen2, Adam10, Adamts4, Mep1b, Cstb
+2.  calculate positive expression rate for App, Bace1, Psen1, Psen2
+3.  organize positive cell rate for each gene into different data frames and visualize with barplots
+
+#### Attach packages
+
+```{r}
+#| output: false
+#| warning: false
+#| error: false
+
+#scRNA-seq analysis
+library(Seurat)
+library(SeuratDisk)
+library(SingleCellExperiment)
+library(scCustomize)
+#data organization
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(scran)
+library(scuttle)
+library(textshape)
+#visualization
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+library(raincloudplots)
+library(PupillometryR)
+library(patchwork)
+library(scales) #for checking colors
+```
+
+#### First define input and output directories
+
+```{r}
+indir<-"/Users/tingsun/Documents/MPI/Data/Bace_proj/OfUse/"
+
+mat_outdir<-"/Users/tingsun/Documents/MPI/Data/Bace_proj/Output/Matrix/"
+umap_outdir<-"/Users/tingsun/Documents/MPI/Data/Bace_proj/Output/UMAP/"
+vln_outdir<-"/Users/tingsun/Documents/MPI/Data/Bace_proj/Output/Violin/"
+bar_output<-"/Users/tingsun/Documents/MPI/Data/Bace_proj/Output/Barplots/"
+dot_output<-'/Users/tingsun/Documents/MPI/Data/Bace_proj/Output/DotPlot/'
+
+dat<-list.files(indir, pattern = ".rds", full.names = TRUE)
+dat
+
+#annotated study name and species
+dat_names<-c("DeppSun_3m", "DeppSun_6m", "Ximerakis2019", "Lake2018", "Jaekel2019", "Ziesel2018", "Zhou2020")
+dat_species<-c("mouse", "mouse", "mouse", "human", "human", "mouse", "human")
+
+#prepare gene list
+gene_core<-c("App", "Bace1", "Psen1", "Psen2")
+gene_all<-c(gene_core, "Adam10", "Adamts4", "Mep1b", "Cstb")
+
+#prepare color panel
+cols_mouse<-c("cornflowerblue","#A3A8C7",
+        "#A6761DFF", "#E8CF41F0", "#E6AB02FF",
+        "#A8A080FC", "#666666FF", "#8CA3A3FA","#C2ADB8FC")
+
+cols_human<-c("cornflowerblue","#A3A8C7",
+        "#A6761DFF", 
+        "#E6AB02FF",
+        "#A8A080FC", "#666666FF", "#8CA3A3FA","#C2ADB8FC")
+```
+
+#### Analysis functions
+
+```{r}
+#function for marking positive expression cells
+andy_pos<-function(dat, gene){
+  position<-match(gene, rownames(dat))
+  #create meta data column
+  dat@meta.data[paste0(gene, "_positive_rate")]<-NA
+  #write in if gene is positively expressed
+  dat@meta.data[which(GetAssayData(object = dat, slot = "counts")[position,]>0), paste0(gene, "_positive_rate")]<-"Pos"
+  dat@meta.data[which(GetAssayData(object = dat, slot = "counts")[position,]==0), paste0(gene, "_positive_rate")]<-"Neg"
+  
+  #also write in normalized expression 
+  dat@meta.data[paste0(gene, "_norm_expression")]<-dat[['SCT']]@data[position,]
+  
+  #return meta.data
+  return(dat@meta.data[,c(paste0(gene, "_norm_expression"),
+                          paste0(gene, "_positive_rate"))])
+}
+
+#visualization function
+andy_org<-function(data, species){
+  #read in data
+  tmp<-readRDS(data) #activate for real function
+  #tmp<-data #activate for test on already read in dataset
+  #data organization
+  tmp@meta.data$CellID<-rownames(tmp@meta.data)
+  #note that CellType_standard is already ordered
+  
+  #modify gene symbols for checking depends on data organism
+  if(species == "mouse"){
+    gene_core_fun<-gene_core
+    gene_all_fun<-gene_all
+    col_fun = cols_mouse
+  } else{
+    gene_core_fun<-toupper(gene_core)
+    gene_all_fun<-toupper(gene_all)
+    col_fun = cols_human
+  } 
+  #re-normalize and scale data
+    tmp<-tmp %>% 
+      SCTransform(., verbose = FALSE, #conserve.memory = TRUE
+                  ) ###########switch between log and SCTransform
+      #NormalizeData(object = .,normalization.method = "LogNormalize",scale.factor = 1e4) %>%
+      #FindVariableFeatures() %>% 
+      #ScaleData()
+  #control step to ensure genes are searchable
+    gene_core_fun<-intersect(gene_core_fun, rownames(tmp))
+    gene_all_fun<-intersect(gene_all_fun, rownames(tmp))
+  #prepare empty data frame and matrix list to store gene exp value and positive expression result
+    meta.tmp<-tmp@meta.data
+    meta.each.gene<-vector(mode = "list", length = length(gene_all_fun))
+      for(i in 1:length(gene_all_fun)){
+        mat<-andy_pos(dat = tmp, gene = gene_all_fun[i])
+        mat$CellID<-rownames(mat)
+        meta.each.gene[[i]]<-mat
+      }
+    #merge single gene result into meta.data matrix based on Cell IDs
+    gene.list.merge<-Reduce(function(dtf1, dtf2) merge(dtf1, dtf2, by = "CellID", all = TRUE), 
+                            meta.each.gene)
+    meta.final<-merge(meta.tmp, gene.list.merge, by = "CellID")
+    rownames(meta.final)<-meta.final$CellID
+    
+    #replace old meta.data
+    tmp@meta.data<-meta.final
+  #return data
+  return(tmp)
+}
+
+```
+
+#### umap and violin plots demonstration using Lake et al 2018 dataset
+
+```{r}
+#test data
+obj<-andy_org(data = "/Users/tingsun/Documents/MPI/Data/Bace_proj/OfUse/GSE97930_Human_Lake_KunZhang_NatBiotech_2018_healthy_snRNA_major_celltype.rds",
+              species = "human")
+obj
+unique(obj@meta.data$CellType_standard)
+
+  #########################visualization panel#######################
+  #export main figure UMAP
+  plot_umap<-DimPlot(obj, group.by = "CellType_standard", label = FALSE,
+                     cols = alpha(cols_human, 0.6), pt.size = 0.1) + 
+  theme(legend.position = "bottom")+
+  ggtitle("Test") #change title
+
+  print(plot_umap)
+  #export main figure violin plot which only contains Ext_Neuron, Ihn_neuron, NFOL, MOL
+    tmp_main<-subset(obj@meta.data, subset = CellType_standard %in% c("Ext_Neuron", "Inh_Neuron", "NFOL", "MOL"))
+        #plot main figure violin only with core genes
+    for(i in toupper(gene_core)){ #change gene names according to species
+        plot_main_vln<-ggplot(tmp_main, aes_string(x = "CellType_standard", y = paste0(i,"_norm_expression"), 
+                                          fill = "CellType_standard", col = "CellType_standard"))+
+        geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .4, adjust = 4)+
+        geom_point(position = position_jitter(width = .15, height = 0), size = 1, alpha = 0.4)+
+        ylab('Normalized expression')+
+        scale_fill_manual(values = cols_human)+
+        scale_color_manual(values = cols_human)+
+        guides(fill=FALSE, col=FALSE)+
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+              panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+        ggtitle(paste0(i, ' normalized expression violin plot'))
+                
+  print(plot_main_vln)
+  #export stack violin plot for all genes across all cell types
+    }
+  
+  #visualized stack violinplot with all genes for supp figure
+  plot_supp_stack_vln<-Stacked_VlnPlot(obj, features = toupper(gene_all), group.by = "CellType_standard",x_lab_rotate = 45,
+                                       add.noise = FALSE, raster = FALSE,
+                                       colors_use = alpha(cols_human, 0.6))
+  plot_supp_stack_vln + plot_annotation(title = "test")
+    
+  plot_supp_stack_vln_half<-lapply(toupper(gene_all), function(x){
+          return(ggplot(obj@meta.data, aes_string(x = "CellType_standard", y = paste0(x,"_norm_expression"), 
+                                          fill = "CellType_standard", col = "CellType_standard"))+
+           geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .4, 
+                            adjust = 4)+
+           geom_point(position = position_jitter(width = .15, height = 0), size = 0.001, alpha = 0.4
+                      )+
+           scale_fill_manual(values = cols_human)+
+           scale_color_manual(values = cols_human)+
+           guides(fill=FALSE, col=FALSE)+
+           ylab(x)+
+           scale_y_continuous(breaks = scales::pretty_breaks(n = 2))+
+           theme(axis.title.x = element_blank(),
+                 axis.text.x = element_blank(),
+                 axis.title.y = element_text(angle = 0, vjust = 0.5, face = "italic"),
+                 panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.background = element_blank(), axis.line = element_line(colour = "black")))
+}) %>%
+  wrap_plots(nrow = length(gene_all), byrow = TRUE) + plot_annotation(title = "test") # change title
+  
+  print(plot_supp_stack_vln_half)
+
+```
+
+#### apply function and export visualization for all datasets within a for loop
+
+```{r}
+#also prepare a empty list of mete.data to store gene positive expression profiles for barplot
+metadata_list<-vector(mode = "list", length = 7)
+
+for(i in 1:7){
+  #####################data organization###########################
+  #read in dataset
+  obj<-andy_org(data = dat[[i]], 
+                species = dat_species[[i]])
+  #write in study name and organize it into plot titles
+  obj@meta.data$Study<-dat_names[[i]]
+  #check species, change gene symbols and color panel accordingly
+  if(dat_species[[i]] == "mouse"){
+    gene_core_tmp<-gene_core
+    gene_all_tmp<-gene_all
+    cols = cols_mouse
+    cols_core = cols_mouse[c(1,2,4,5)] #skip NFOL
+  }else{
+    gene_core_tmp<-toupper(gene_core)
+    gene_all_tmp<-toupper(gene_all)
+    cols = cols_human
+    cols_core = cols_human[c(1,2,4)]
+  }
+  #control gene is annotated
+  gene_core_tmp<-intersect(gene_core_tmp, rownames(obj))
+  gene_all_tmp<-intersect(gene_all_tmp, rownames(obj))
+  
+  ##################export meta.data#########################
+  #store it in list for barplot visualization
+  metadata_list[[i]]<-obj@meta.data
+  #>>>>>>>>>>data saving step<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+  write.csv(obj@meta.data,
+            file = paste0(mat_outdir,dat_names[[i]],"_meta.data.csv"),
+            quote = FALSE, row.names = FALSE)
+  
+  #########################visualization panel#######################
+  #export main figure UMAP
+  plot_umap<-DimPlot(obj, group.by = "CellType_standard", label = FALSE,
+                     cols = alpha(cols, 0.6), pt.size = 0.1, raster = FALSE) + 
+  theme(legend.position = "bottom")+
+  ggtitle(paste0(dat_names[[i]]), " UMAP")
+  
+  #Single violins for main figure
+  #export main figure violin plot which only contains Ext_Neuron, Ihn_neuron, NFOL, MOL
+  tmp_main<-subset(obj@meta.data, subset = CellType_standard %in% c("Ext_Neuron", "Inh_Neuron", "NFOL", "MOL"))
+  #plot main figure violin only with core genes
+  for(k in gene_core_tmp){ #change gene names according to species
+        plot_main_vln<-ggplot(tmp_main, aes_string(x = "CellType_standard", y = paste0(k,"_norm_expression"), 
+                                          fill = "CellType_standard", col = "CellType_standard"))+
+        geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .4, adjust = 4)+
+        geom_point(position = position_jitter(width = .15, height = 0), size = 0.1, alpha = 0.4)+
+        ylab('Normalized expression')+
+        scale_fill_manual(values = cols_core)+
+        scale_color_manual(values = cols_core)+
+        guides(fill=FALSE, col=FALSE)+
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+        ggtitle(paste0(dat_names[[i]], ": ", k, ' normalized expression violin plot'))
+  #>>>>>>>>>>data saving step<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+  pdf(file = paste0(vln_outdir,dat_names[[i]],"_MainFig_", k, "_Violin.pdf"))
+    print(plot_main_vln)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(vln_outdir,dat_names[[i]],"_MainFig_", k, "_Violin.eps"))
+    print(plot_main_vln)
+  dev.off()
+    }
+  #export stack violin plot for all genes across all cell types
+  #visualized stack violin plot with all genes for supp figure
+    #two types with or without data points since Andrew is demanding
+  plot_supp_stack_vln<-Stacked_VlnPlot(obj, features = gene_all_tmp, group.by = "CellType_standard",x_lab_rotate = 45, raster = FALSE,
+                                       colors_use = alpha(cols, 0.6), add.noise = FALSE) + 
+    plot_annotation(title = paste0(dat_names[[i]], ": Stacked violin plot"))
+  
+  plot_supp_stack_vln_half<-lapply(gene_all_tmp, function(x){
+          return(ggplot(obj@meta.data, aes_string(x = "CellType_standard", y = paste0(x,"_norm_expression"), 
+                                          fill = "CellType_standard", col = "CellType_standard"))+
+           geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .4, adjust = 4)+
+           geom_point(position = position_jitter(width = .15, height = 0), size = 0.001, alpha = 0.4)+
+           scale_fill_manual(values = cols)+
+           scale_color_manual(values = cols)+
+           guides(fill=FALSE, col=FALSE)+
+           ylab(x)+
+           scale_y_continuous(breaks = scales::pretty_breaks(n = 2))+
+           theme(axis.title.x = element_blank(),
+                 axis.text.x = element_blank(),
+                 axis.title.y = element_text(angle = 0, vjust = 0.5, face = "italic"),
+                 panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+                 panel.background = element_blank(), axis.line = element_line(colour = "black")))
+}) %>%
+  wrap_plots(nrow = length(gene_all_tmp), byrow = TRUE) + 
+    plot_annotation(title = paste0(dat_names[[i]], ": Stacked half violin plot")) # change title
+  
+  #>>>>>>>>>>data saving step<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+  #uamp
+  pdf(file = paste0(umap_outdir,dat_names[[i]],"_UMAP.pdf"))
+    print(plot_umap)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(umap_outdir,dat_names[[i]],"_UMAP.eps"))
+    print(plot_umap)
+  dev.off()
+  #first violin
+  pdf(file = paste0(vln_outdir,dat_names[[i]],"_SuppFig_Stacked_Violin.pdf"))
+    print(plot_supp_stack_vln)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(vln_outdir,dat_names[[i]],"_SuppFig_Stacked_Violin.eps"))
+    print(plot_supp_stack_vln)
+  dev.off()
+  #half violin
+  pdf(file = paste0(vln_outdir,dat_names[[i]],"_SuppFig_Stacked_halfViolin.pdf"))
+    print(plot_supp_stack_vln_half)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(vln_outdir,dat_names[[i]],"_SuppFig_Stacked_halfViolin.eps"))
+    print(plot_supp_stack_vln_half)
+  dev.off()
+  
+  rm(obj)
+  gc()
+}
+
+```
+
+#### aggregate positive expression matrix from each study for barplot
+
+```{r}
+names(metadata_list)<-dat_names
+
+length(metadata_list)
+head(metadata_list)
+```
+
+#### for barplot, do it for each gene
+
+```{r}
+#for this part, seperate mouse and human data, data orders are listed below
+#dat_names<-c("DeppSun_3m", "DeppSun_6m", "Ximerakis2019", "Lake2018", "Jaekel2019", "Ziesel2018", "Zhou2020")
+#dat_species<-c("mouse", "mouse", "mouse", "human", "human", "mouse", "human")
+
+#human
+human_mat<-vector(mode = 'list', length = 3)
+human_dat_positions<-c(4,5,7)
+
+for(i in 1:3){
+  #prepare temporary empty list for matrix of each gene
+  genes_human<-toupper(gene_all)
+  mat.list<-vector(mode = 'list', length = length(gene_all))
+  position<-human_dat_positions[i]
+  
+  for (x in 1:length(gene_all)) {
+  gene_check<-paste0(genes_human[[x]], '_positive_rate') #change gene based on species
+  gene.pos.mat<- as.data.frame(t(prop.table(table(metadata_list[[position]][, gene_check], 
+                                              metadata_list[[position]]$CellType_standard), 
+                                        margin = 2)['Pos',]) 
+  )
+  gene.pos.mat$Gene<-gene_check
+  gene.pos.mat$Study<-dat_names[[position]]
+  mat.list[[x]]<-gene.pos.mat
+  }
+  human_mat[[i]]<-Reduce(rbind, mat.list)
+}
+
+human_mat_all<-bind_rows(human_mat)
+human_mat_all[is.na(human_mat_all)]<-0
+human_mat_all
+
+write.csv(human_mat_all,
+            file = paste0(bar_output, '/pos_rate_mat/Human_allGenes_postive_exp_rate.csv'),
+            quote = FALSE)
+
+##############Visualization
+
+#proceed to barplot
+for(k in 1:length(gene_all)){
+  #get sub matrix of one gene
+  position<-grep(genes_human[[k]], human_mat_all$Gene)
+  tmp_mat<-human_mat_all[position, -match('Gene', colnames(human_mat_all))]
+  
+  tmp_mat<- gather(tmp_mat, 'CellType_standard', 'positive_rate', -Study)
+  
+  tmp_mat$CellType_standard<-factor(tmp_mat$CellType_standard,
+                                      levels = c("Ext_Neuron", "Inh_Neuron",
+                                                 "OPC", "MOL","AST","MG",
+                                                 "Endo","Pericyte" ))
+  tmp_mat$Study<-factor(tmp_mat$Study,
+                        levels = c("Lake2018", "Jaekel2019", "Zhou2020")
+  )
+
+  barplot_pos_rate<- ggplot(data= tmp_mat, aes(x=CellType_standard, y=positive_rate, fill=CellType_standard,
+                              alpha = Study)) +
+      geom_bar(stat = 'identity' , position=position_dodge())+
+      scale_fill_manual(values = cols_human)+
+      scale_alpha_manual(values = c(0.5, 0.65, 0.8))+
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+            panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+      ggtitle(paste0('Human', ": ", genes_human[[k]], ' positive expression rate'))
+  
+  #save matrix and plots
+  write.csv(tmp_mat,
+            file = paste0(bar_output, '/pos_rate_mat/Human_', genes_human[[k]], '_postive_exp_rate_barplot.csv'),
+            quote = FALSE)
+  
+  pdf(file = paste0(bar_output, '/pos_rate_plots/Human_', genes_human[[k]], '_postive_exp_rate_barplot.pdf'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(bar_output, '/pos_rate_plots/Human_', genes_human[[k]], '_postive_exp_rate_barplot.eps'))
+  print(barplot_pos_rate)
+  dev.off()
+}
+```
+
+```{r}
+#for this part, seperate mouse and human data, data orders are listed below
+#dat_names<-c("DeppSun_3m", "DeppSun_6m", "Ximerakis2019", "Lake2018", "Jaekel2019", "Ziesel2018", "Zhou2020")
+#dat_species<-c("mouse", "mouse", "mouse", "human", "human", "mouse", "human")
+
+#human
+mouse_mat<-vector(mode = 'list', length = 4)
+mouse_dat_positions<-c(1,2,3,6)
+
+#modify ximerakis data manually since Mep1b is missing
+metadata_list[[3]]$Mep1b_norm_expression<-0
+metadata_list[[3]]$Mep1b_positive_rate<-'Neg'
+#add 1 random noise at neuron data to be able to pass the following script
+metadata_list[[3]]$Mep1b_positive_rate[6]<-'Pos'
+
+#modify ximerakis data manually since Mep1b is missing
+metadata_list[[6]]$Mep1b_norm_expression<-0
+metadata_list[[6]]$Mep1b_positive_rate<-'Neg'
+#add 1 random noise at neuron data to be able to pass the following script
+metadata_list[[6]]$Mep1b_positive_rate[6]<-'Pos'
+
+for(i in 1:4){
+  #prepare temporary empty list for matrix of each gene
+  genes_mouse<-gene_all
+  mat.list<-vector(mode = 'list', length = length(gene_all))
+  position<-mouse_dat_positions[i]
+  
+  for (x in 1:length(gene_all)) {
+  gene_check<-paste0(genes_mouse[[x]], '_positive_rate')
+ 
+  gene.pos.mat<-as.data.frame(t(prop.table(table(metadata_list[[position]][,gene_check], 
+                                              metadata_list[[position]]$CellType_standard), 
+                                        margin = 2)['Pos',])
+  )
+  gene.pos.mat$Gene<-gene_check
+  gene.pos.mat$Study<-dat_names[[position]]
+  mat.list[[x]]<-gene.pos.mat
+  }
+  mouse_mat[[i]]<-bind_rows(mat.list)
+}
+
+mouse_mat_all<-bind_rows(mouse_mat)
+mouse_mat_all[is.na(mouse_mat_all)]<-0
+mouse_mat_all
+
+write.csv(mouse_mat_all,
+            file = paste0(bar_output, '/pos_rate_mat/Mouse_allGenes_postive_exp_rate.csv'),
+            quote = FALSE)
+
+##############Visualization
+
+#proceed to barplot
+for(k in 1:length(gene_all)){
+  #get sub matrix of one gene
+  position<-grep(genes_mouse[[k]], mouse_mat_all$Gene)
+  tmp_mat<-mouse_mat_all[position, -match('Gene', colnames(mouse_mat_all))]
+  
+  tmp_mat<- gather(tmp_mat, 'CellType_standard', 'positive_rate', -Study)
+  
+  tmp_mat$CellType_standard<-factor(tmp_mat$CellType_standard,
+                                      levels = c("Ext_Neuron", "Inh_Neuron",
+                                                 "OPC", 'NFOL',"MOL","AST","MG",
+                                                 "Endo","Pericyte" ))
+
+  barplot_pos_rate<- ggplot(data= tmp_mat, aes(x=CellType_standard, y=positive_rate, fill=CellType_standard,
+                              alpha = Study)) +
+      geom_bar(stat = 'identity' , position=position_dodge())+
+      scale_fill_manual(values = cols_mouse)+
+      scale_alpha_manual(values = c(0.5, 0.6, 0.7, 0.8))+
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+            panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+      ggtitle(paste0('Mouse', ": ", genes_mouse[[k]], ' positive expression rate'))
+  
+  #save matrix and plots
+  write.csv(tmp_mat,
+            file = paste0(bar_output, '/pos_rate_mat/Mouse_', genes_mouse[[k]], '_postive_exp_rate_barplot.csv'),
+            quote = FALSE)
+  
+  pdf(file = paste0(bar_output, '/pos_rate_plots/Mouse_', genes_mouse[[k]], '_postive_exp_rate_barplot.pdf'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(bar_output, '/pos_rate_plots/Mouse_', genes_mouse[[k]], '_postive_exp_rate_barplot.eps'))
+  print(barplot_pos_rate)
+  dev.off()
+}
+```
+
+#### continue to export proportion plot of positive cells across different cell types
+
+```{r}
+#for this part, seperate mouse and human data, data orders are listed below
+#dat_names<-c("DeppSun_3m", "DeppSun_6m", "Ximerakis2019", "Lake2018", "Jaekel2019", "Ziesel2018", "Zhou2020")
+#dat_species<-c("mouse", "mouse", "mouse", "human", "human", "mouse", "human")
+
+#human
+human_mat<-vector(mode = 'list', length = 3)
+human_dat_positions<-c(4,5,7)
+
+for(i in 1:3){
+  #prepare temporary empty list for matrix of each gene
+  genes_human<-toupper(gene_all)
+  mat.list<-vector(mode = 'list', length = length(gene_all))
+  position<-human_dat_positions[i]
+  
+  for (x in 1:length(gene_all)) {
+  gene_check<-paste0(genes_human[[x]], '_positive_rate') #change gene based on species
+  gene.pos.mat<- as.data.frame(t(prop.table(table(metadata_list[[position]][, gene_check], 
+                                              metadata_list[[position]]$CellType_standard), 
+                                            ################
+                                            #only different from script before is the way to calculate proportion
+                                            #across cell types instead of across pos vs neg cells
+                                        margin = 1)['Pos',]) 
+  )
+  gene.pos.mat$Gene<-gene_check
+  gene.pos.mat$Study<-dat_names[[position]]
+  mat.list[[x]]<-gene.pos.mat
+  }
+  human_mat[[i]]<-Reduce(rbind, mat.list)
+}
+
+human_mat_all<-bind_rows(human_mat)
+human_mat_all[is.na(human_mat_all)]<-0
+human_mat_all
+
+write.csv(human_mat_all,
+            file = paste0(bar_output, '/stack_barplot_mat/Human_allGenes_CrossCellType_positive_proportion.csv'),
+            quote = FALSE)
+
+##############Visualization
+
+#proceed to barplot
+for(k in 1:length(gene_all)){
+  #get sub matrix of one gene
+  position<-grep(genes_human[[k]], human_mat_all$Gene)
+  tmp_mat<-human_mat_all[position, -match('Gene', colnames(human_mat_all))]
+  
+  tmp_mat<- gather(tmp_mat, 'CellType_standard', 'positive_rate', -Study)
+  
+  tmp_mat$CellType_standard<-factor(tmp_mat$CellType_standard,
+                                      levels = c("Ext_Neuron", "Inh_Neuron",
+                                                 "OPC", "MOL","AST","MG",
+                                                 "Endo","Pericyte" ))
+  tmp_mat$Study<-factor(tmp_mat$Study,
+                        levels = c("Lake2018", "Jaekel2019", "Zhou2020")
+  )
+
+  barplot_pos_rate<- ggplot(data= tmp_mat, aes(x=Study, y=positive_rate, fill=CellType_standard)) +
+      geom_bar(stat = 'identity' , position='fill', width = 0.5)+
+      scale_fill_manual(values = alpha(cols_human, 0.75))+
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+            panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+      ggtitle(paste0('Human', ": ", genes_human[[k]], ' positive expression proportion'))
+  
+  #save matrix and plots
+  write.csv(tmp_mat,
+            file = paste0(bar_output, '/stack_barplot_mat/Human_', genes_human[[k]], '_CrossCellType_positive_proportion.csv'),
+            quote = FALSE)
+  
+  pdf(file = paste0(bar_output, '/stack_barplot/Human_', genes_human[[k]], '_CrossCellType_positive_proportion_barplot.pdf'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(bar_output, '/stack_barplot/Human_', genes_human[[k]], '_CrossCellType_positive_proportion_barplot.eps'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  print(barplot_pos_rate)
+}
+```
+
+```{r}
+#for this part, seperate mouse and human data, data orders are listed below
+#dat_names<-c("DeppSun_3m", "DeppSun_6m", "Ximerakis2019", "Lake2018", "Jaekel2019", "Ziesel2018", "Zhou2020")
+#dat_species<-c("mouse", "mouse", "mouse", "human", "human", "mouse", "human")
+
+#mouse
+mouse_mat<-vector(mode = 'list', length = 4)
+mouse_dat_positions<-c(1,2,3,6)
+
+#modify ximerakis data manually since Mep1b is missing
+metadata_list[[3]]$Mep1b_norm_expression<-0
+metadata_list[[3]]$Mep1b_positive_rate<-'Neg'
+
+#for loop, run without Mep1b
+gene_all_alt<-c(gene_core, "Adam10", "Adamts4", "Cstb")
+
+for(i in 1:4){
+  #prepare temporary empty list for matrix of each gene
+  genes_mouse<-gene_all_alt
+  mat.list<-vector(mode = 'list', length = length(gene_all_alt))
+  position<-mouse_dat_positions[i]
+  
+  for (x in 1:length(gene_all_alt)) {
+  gene_check<-paste0(genes_mouse[[x]], '_positive_rate')
+ 
+  gene.pos.mat<-as.data.frame(t(prop.table(table(metadata_list[[position]][,gene_check], 
+                                              metadata_list[[position]]$CellType_standard), 
+                                           #same as human data
+                                           #change proportion calculation to across cell types
+                                        margin = 1)['Pos',])
+  )
+  gene.pos.mat$Gene<-gene_check
+  gene.pos.mat$Study<-dat_names[[position]]
+  mat.list[[x]]<-gene.pos.mat
+  }
+  mouse_mat[[i]]<-bind_rows(mat.list)
+}
+
+mouse_mat_all<-bind_rows(mouse_mat)
+mouse_mat_all[is.na(mouse_mat_all)]<-0
+mouse_mat_all
+
+write.csv(mouse_mat_all,
+            file = paste0(bar_output, '/stack_barplot_mat/Mouse_CrossCellType_positive_proportion.csv'),
+            quote = FALSE)
+
+##############Visualization
+
+#proceed to barplot
+for(k in 1:length(gene_all_alt)){
+  #get sub matrix of one gene
+  position<-grep(genes_mouse[[k]], mouse_mat_all$Gene)
+  tmp_mat<-mouse_mat_all[position, -match('Gene', colnames(mouse_mat_all))]
+  
+  tmp_mat<- gather(tmp_mat, 'CellType_standard', 'positive_rate', -Study)
+  
+  tmp_mat$CellType_standard<-factor(tmp_mat$CellType_standard,
+                                      levels = c("Ext_Neuron", "Inh_Neuron",
+                                                 "OPC", 'NFOL',"MOL","AST","MG",
+                                                 "Endo","Pericyte" ))
+
+  barplot_pos_rate<- ggplot(data= tmp_mat, aes(x=Study, y=positive_rate, fill=CellType_standard)) +
+      geom_bar(stat = 'identity' , position='fill', width = 0.5)+
+      scale_fill_manual(values = alpha(cols_mouse, alpha = 0.75))+
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+            panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+      ggtitle(paste0('Mouse', ": ", genes_mouse[[k]], ' positive expression proportion'))
+  
+  #save matrix and plots
+  write.csv(tmp_mat,
+            file = paste0(bar_output, '/stack_barplot_mat/Mouse_', genes_mouse[[k]], '_CrossCellType_positive_proportion.csv'),
+            quote = FALSE)
+  
+  pdf(file = paste0(bar_output, '/stack_barplot/Mouse_', genes_mouse[[k]], 'CrossCellType_positive_proportion_barplot.pdf'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(bar_output, '/stack_barplot/Mouse_', genes_mouse[[k]], 'CrossCellType_positive_proportion_barplot.eps'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  print(barplot_pos_rate)
+}
+```
+
+do stack barplot seperatedly for Mep1b, without Ximerakis data
+
+```{r}
+mouse_mat<-vector(mode = 'list', length = 2)
+mouse_dat_positions<-c(1,2)
+
+#for loop, run without Mep1b
+gene_all_alt<-'Mep1b'
+
+for(i in 1:2){
+  #prepare temporary empty list for matrix of each gene
+  genes_mouse<-'Mep1b'
+  position<-mouse_dat_positions[i]
+  
+  gene_check<-'Mep1b_positive_rate'
+ 
+  gene.pos.mat<-as.data.frame(t(prop.table(table(metadata_list[[position]][,gene_check], 
+                                              metadata_list[[position]]$CellType_standard), 
+                                           #same as human data
+                                           #change proportion calculation to across cell types
+                                        margin = 1)['Pos',])
+  )
+  gene.pos.mat$Gene<-gene_check
+  gene.pos.mat$Study<-dat_names[[position]]
+
+  mouse_mat[[i]]<-gene.pos.mat
+}
+
+mouse_mat_all<-bind_rows(mouse_mat)
+mouse_mat_all[is.na(mouse_mat_all)]<-0
+mouse_mat_all
+
+write.csv(mouse_mat_all,
+            file = paste0(bar_output, '/stack_barplot_mat/Mouse_Mep1b_CrossCellType_positive_proportion.csv'),
+            quote = FALSE)
+
+##############Visualization
+
+#proceed to barplot
+  #get sub matrix of one gene
+  position<-grep('Mep1b', mouse_mat_all$Gene)
+  tmp_mat<-mouse_mat_all[position, -match('Gene', colnames(mouse_mat_all))]
+  
+  tmp_mat<- gather(tmp_mat, 'CellType_standard', 'positive_rate', -Study)
+  
+  tmp_mat$CellType_standard<-factor(tmp_mat$CellType_standard,
+                                      levels = c("Ext_Neuron", "Inh_Neuron",
+                                                 "OPC", 'NFOL',"MOL","AST","MG",
+                                                 "Endo","Pericyte" ))
+
+  barplot_pos_rate<- ggplot(data= tmp_mat, aes(x=Study, y=positive_rate, fill=CellType_standard)) +
+      geom_bar(stat = 'identity' , position='fill', width = 0.5)+
+      scale_fill_manual(values = alpha(cols_mouse, alpha = 0.75))+
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+            panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+      ggtitle(paste0('Mouse: Mep1b positive expression proportion'))
+  
+  #save matrix and plots
+  write.csv(tmp_mat,
+            file = paste0(bar_output, '/stack_barplot_mat/Mouse_Mep1b_CrossCellType_positive_proportion.csv'),
+            quote = FALSE)
+  
+  pdf(file = paste0(bar_output, '/stack_barplot/Mouse_Mep1b_CrossCellType_positive_proportion_barplot.pdf'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  setEPS()
+  postscript(file = paste0(bar_output, '/stack_barplot/Mouse_Mep1b_CrossCellType_positive_proportion_barplot.eps'))
+  print(barplot_pos_rate)
+  dev.off()
+  
+  print(barplot_pos_rate)
+```
+
+#### as requested, export featuremaps for featureplot
+
+Depp Sun 6m, Zhou human data for Bace1, App, Psen1 and Psen2
+
+```{r}
+deppsun<-readRDS("/Users/tingsun/Documents/MPI/Data/Bace_proj/OfUse//2023DeppSun_6m_WT_NeuronCleaned.rds")
+zhou<-readRDS("/Users/tingsun/Documents/MPI/Data/Bace_proj/OfUse//SYN21125841_Human_Zhou_2020_snRNA_healthy_major_celltypes.rds")
+
+featureplot_out<-'/Users/tingsun/Documents/MPI/Data/Bace_proj/Output/FeaturePlot/'
+
+deppsun<-SCTransform(deppsun)
+zhou<-SCTransform(zhou)
+
+deppsun
+```
+
+##### proceed to featureplots
+
+```{r}
+(deppsun_log<-FeaturePlot(deppsun, features = c('App','Bace1','Psen1','Psen2'), ncol = 2))
+(zhou_log<-FeaturePlot(zhou, features = c('APP','BACE1','PSEN1','PSEN2'), ncol = 2))
+
+pdf(file = paste0(featureplot_out,'DeppSun6m_FeaturePlot_SCT.pdf'))
+print(deppsun_log)
+dev.off()
+
+setEPS()
+postscript(file = paste0(featureplot_out,'DeppSun6m_FeaturePlot_SCT.eps'))
+print(deppsun_log)
+dev.off()
+
+pdf(file = paste0(featureplot_out,'Zhou_FeaturePlot_SCT.pdf'))
+print(zhou_log)
+dev.off()
+
+setEPS()
+postscript(file = paste0(featureplot_out,'Zhou_FeaturePlot_SCT.eps'))
+print(zhou_log)
+dev.off()
+```
+
+#### session information
+```{r}
+sessionInfo()
+```
